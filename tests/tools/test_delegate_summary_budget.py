@@ -16,14 +16,20 @@ import tools.delegate_tool as dt
 
 
 class _FakeCompressor:
-    def __init__(self, context_length, max_tokens):
+    def __init__(self, context_length, max_tokens, last_prompt_tokens=0):
         self.context_length = context_length
         self.max_tokens = max_tokens
+        # Patch 070: the budget reads last_prompt_tokens first.
+        # When 0/missing it falls back to last_real_prompt_tokens, then to
+        # the parent's session_prompt_tokens.  Tests that pass a non-zero
+        # value here exercise the primary code path; tests that leave it 0
+        # exercise the fallback chain.
+        self.last_prompt_tokens = last_prompt_tokens
 
 
 class _FakeParent:
-    def __init__(self, context_length, used_tokens, max_tokens):
-        self.context_compressor = _FakeCompressor(context_length, max_tokens)
+    def __init__(self, context_length, used_tokens, max_tokens, last_prompt_tokens=0):
+        self.context_compressor = _FakeCompressor(context_length, max_tokens, last_prompt_tokens)
         self.session_prompt_tokens = used_tokens
 
 
@@ -75,4 +81,34 @@ def test_empty_results_is_noop():
     dt._apply_summary_budget(
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
+    )
+
+
+def test_last_prompt_tokens_preferred_over_session_accumulator():
+    """Patch 070: last_prompt_tokens (current context) must override
+    session_prompt_tokens (lifetime accumulator).
+
+    The bug: session_prompt_tokens only ever grows, so on a long session
+    headroom was permanently negative → every summary starved to the
+    2000-char floor even when the live context was nearly empty.
+    """
+    # session_prompt_tokens=999_999 (huge, would starve), but
+    # last_prompt_tokens=5_000 (real current usage, lots of headroom).
+    parent = _FakeParent(
+        context_length=200_000,
+        used_tokens=999_999,  # stale accumulator
+        max_tokens=8_000,
+        last_prompt_tokens=5_000,  # real current usage
+    )
+    big = "HEAD_MARKER\n" + ("Y" * 20_000) + "\nTAIL_MARKER"
+    results = [{"task_index": 0, "summary": big, "status": "completed"}]
+    dt._apply_summary_budget(results, parent)
+    # With last_prompt_tokens=5_000, headroom is large (~187k tokens × 0.1
+    # ÷ 1 summary × 4 chars/token ≈ 74k chars) → 20k summary should NOT be
+    # truncated. If the code used session_prompt_tokens (999_999), headroom
+    # would be negative and the summary would hit the 2000-char floor.
+    assert "summary_truncated" not in results[0], (
+        "summary was truncated despite low last_prompt_tokens — the budget "
+        "is using session_prompt_tokens (accumulator) instead of "
+        "last_prompt_tokens (current context). Patch 070 regression."
     )

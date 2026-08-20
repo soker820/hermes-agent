@@ -387,6 +387,28 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def recall(self, query: str, target: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """Search memory entries by case-insensitive substring match. Returns matching entries."""
+        query_lower = query.lower()
+        results: List[Dict[str, Any]] = []
+        targets = [target] if target else ["memory", "user"]
+        # Split the limit evenly across stores (limit // len(targets)) so one
+        # store cannot starve the other; when limit is not evenly divisible the
+        # total may come back slightly lower (limit=5, 2 stores → 4) — even
+        # distribution beats padding one store past its fair share.
+        per_store_limit = max(1, limit // len(targets)) if len(targets) > 1 else limit
+        for t in targets:
+            store_hits = 0
+            for i, entry in enumerate(self._entries_for(t)):
+                if query_lower in entry.lower():
+                    results.append({"target": t, "index": i, "content": entry})
+                    store_hits += 1
+                    if store_hits >= per_store_limit:
+                        break
+            if len(results) >= limit:
+                return results
+        return results
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -1085,10 +1107,10 @@ def memory_tool(
     # Accept new_text as an alias for content (single-op path). See docstring.
     if content is None and new_text is not None:
         content = new_text
-
     # Some strict providers fill optional schema fields with JSON null rather
     # than omitting them.  Treat ``target: null`` as omitted so memory writes
     # still use the documented default store instead of failing validation.
+    _recall_target = target  # preserve original for dual-store recall
     if target is None:
         target = "memory"
 
@@ -1121,6 +1143,16 @@ def memory_tool(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    # --- Recall path (read-only, no gate needed) --------------------------
+    if action == "recall":
+        if not content:
+            return tool_error("Content (query) is required for 'recall' action.", success=False)
+        results = store.recall(content, _recall_target)
+        response = {"success": True, "query": content, "matches": results, "count": len(results)}
+        if not results:
+            response["hint"] = "No matches. Try a different keyword or use action=add if this is new info."
+        return json.dumps(response, ensure_ascii=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
@@ -1211,6 +1243,8 @@ MEMORY_SCHEMA = {
         "detail, or you learn a stable fact about their environment, conventions, or workflow. "
         "Priority: user preferences & corrections > environment facts > procedures. The best "
         "memory stops the user repeating themselves.\n\n"
+        "RECALL: use action=recall to search existing memories by keyword. Pass the search "
+        "term in content. Returns matching entries. Use this before adding duplicate entries.\n\n"
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
@@ -1224,7 +1258,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "recall"],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
             "target": {
@@ -1234,7 +1268,7 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace' (single-op shape). Alias: 'new_text' is also accepted (mirrors old_text)."
+                "description": "The entry content. Required for 'add', 'replace', and 'recall' (single-op shape). Alias: 'new_text' is also accepted (mirrors old_text)."
             },
             "old_text": {
                 "type": "string",

@@ -1641,6 +1641,22 @@ class ShellFileOperations(FileOperations):
                     f"{total_lines}."
                 ),
             )
+        # Memory file guard: warn the agent that this file is managed by the
+        # memory tool and must not be modified via write_file/patch. The system
+        # prompt snapshot of this file may be stale; trust disk, not snapshot.
+        # Scoped to files whose parent directory is a "memories" dir (the
+        # profile-scoped memory store) to avoid false hits on same-named
+        # files in user projects. (custom-patches, 2026-07-28)
+        _mem_basename = os.path.basename(path)
+        _mem_parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        if _mem_basename in ("MEMORY.md", "USER.md") and _mem_parent == "memories":
+            _mem_warn = (
+                "⚠️ This file is managed by the memory tool. "
+                "Use memory(action='add/replace/remove'), NOT write_file/patch. "
+                "write_file bypasses drift detection and can clobber concurrent session writes. "
+                "Emergency fixes only with [EMERGENCY-MEMORY-FIX] annotation."
+            )
+            hint = (hint + "\n\n" + _mem_warn) if hint else _mem_warn
 
         return ReadResult(
             content=self._add_line_numbers(read_output, offset),

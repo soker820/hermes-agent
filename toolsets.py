@@ -226,6 +226,12 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "review": {
+        "description": "Read-only file access for subagent review/discussion tasks. No write_file, patch, or terminal — enforced at code level, not prompt.",
+        "tools": ["read_file", "search_files", "session_search"],
+        "includes": []
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",

@@ -242,50 +242,6 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                          "extra_ua_tags must be ['channel'] to enable group event routing")
 
 
-    @patch.dict(os.environ, {}, clear=True)
-    def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {"calls": []}
-
-        class _MessageAPI:
-            def update(self, request):
-                captured["calls"].append(request)
-                if len(captured["calls"]) == 1:
-                    return SimpleNamespace(success=lambda: False, code=230001, msg="content format of the post type is incorrect")
-                return SimpleNamespace(success=lambda: True)
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.edit_message(
-                    chat_id="oc_chat",
-                    message_id="om_progress",
-                    content="可以用 **粗体** 和 *斜体*。",
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(captured["calls"][0].request_body.msg_type, "post")
-        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
-        self.assertEqual(
-            captured["calls"][1].request_body.content,
-            json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
-        )
-
-
 class TestAdapterModule(unittest.TestCase):
     def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -1245,130 +1201,6 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(captured["request"].request_body.reply_in_thread)
-
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_send_uses_post_for_every_chunk_of_multi_chunk_markdown(self):
-        """Regression for #26841: when a long Markdown message is split
-        across multiple chunks, every chunk must go out as
-        ``msg_type=post`` — including chunk 1.  The bug was that the
-        first chunk often had only plain prose (the per-chunk regex
-        didn't match) and was sent as ``text``, so users saw literal
-        ``**bold``/``## heading``/code fences while later chunks
-        rendered correctly.
-        """
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = []
-
-        class _MessageAPI:
-            def create(self, request):
-                captured.append(request)
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(
-                        message_id=f"om_chunk_{len(captured)}",
-                    ),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        # Force a deterministic split so the test doesn't depend on the
-        # exact 8000-char limit.  Chunk 1 is plain prose; chunk 2 has
-        # the markdown markers.  Without the fix, chunk 1 went out as
-        # ``msg_type=text``.
-        first_chunk = "Here is a short intro that has no markdown markers at all."
-        second_chunk = "## Heading\nAnd then some **bold** text."
-
-        with patch.object(
-            adapter, "truncate_message", return_value=[first_chunk, second_chunk],
-        ), patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.send(
-                    chat_id="oc_chat",
-                    content=first_chunk + "\n" + second_chunk,
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(len(captured), 2)
-        msg_types = [r.request_body.msg_type for r in captured]
-        self.assertEqual(msg_types, ["post", "post"])
-
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_send_splits_fenced_code_blocks_into_separate_post_rows(self):
-        from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        captured = {}
-
-        class _MessageAPI:
-            def create(self, request):
-                captured["request"] = request
-                return SimpleNamespace(
-                    success=lambda: True,
-                    data=SimpleNamespace(message_id="om_codeblock"),
-                )
-
-        adapter._client = SimpleNamespace(
-            im=SimpleNamespace(
-                v1=SimpleNamespace(
-                    message=_MessageAPI(),
-                )
-            )
-        )
-
-        async def _direct(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        content = (
-            "确认已入库 ✓\n"
-            "文件路径：`/root/.hermes/profiles/agent_cto/cron/jobs.json`\n"
-            "**解码后的内容：**\n"
-            "```json\n"
-            '{"cron": "list"}\n'
-            "```\n"
-            "后续说明仍应保留。"
-        )
-
-        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
-            result = asyncio.run(
-                adapter.send(
-                    chat_id="oc_chat",
-                    content=content,
-                )
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(captured["request"].request_body.msg_type, "post")
-        payload = json.loads(captured["request"].request_body.content)
-        rows = payload["zh_cn"]["content"]
-        self.assertEqual(
-            rows,
-            [
-                [
-                    {
-                        "tag": "md",
-                        "text": "确认已入库 ✓\n文件路径：`/root/.hermes/profiles/agent_cto/cron/jobs.json`\n**解码后的内容：**",
-                    }
-                ],
-                [{"tag": "md", "text": "```json\n{\"cron\": \"list\"}\n```"}],
-                [{"tag": "md", "text": "后续说明仍应保留。"}],
-            ],
-        )
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
@@ -2466,4 +2298,107 @@ class TestChatLockEviction(unittest.TestCase):
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
 
+    def test_lru_eviction_respects_recent_access(self):
+        adapter = self._make_adapter(max_size=5)
+        for i in range(5):
+            adapter._get_chat_lock(f"c{i}")
+        # Touch c0 so it is no longer the LRU entry, then add a new chat.
+        adapter._get_chat_lock("c0")
+        adapter._get_chat_lock("c_new")
+        self.assertEqual(len(adapter._chat_locks), 5)
+        self.assertNotIn("c1", adapter._chat_locks)  # c1 was the true LRU
+        self.assertIn("c0", adapter._chat_locks)
+        self.assertIn("c_new", adapter._chat_locks)
+
+    def test_eviction_skips_held_locks(self):
+        adapter = self._make_adapter(max_size=3)
+
+        async def _run():
+            held = adapter._get_chat_lock("held")
+            await held.acquire()
+            try:
+                adapter._get_chat_lock("x")
+                adapter._get_chat_lock("y")
+                # At capacity; "held" is LRU but locked, so "x" should go instead.
+                adapter._get_chat_lock("z")
+                self.assertIn("held", adapter._chat_locks)
+                self.assertNotIn("x", adapter._chat_locks)
+                self.assertEqual(len(adapter._chat_locks), 3)
+            finally:
+                held.release()
+
+        asyncio.run(_run())
+
+
+class TestInteractiveMessageNormalization(unittest.TestCase):
+    """Tests for _normalize_interactive_message — title dedup and byte-budget truncation."""
+
+    def test_title_not_duplicated_when_body_has_bold_version(self):
+        """Header title '审计结果' (stripped) should dedup against body '**审计结果**'."""
+        from plugins.platforms.feishu.adapter import _normalize_interactive_message
+        card = {
+            "header": {"title": {"tag": "plain_text", "content": "审计结果"}},
+            "elements": [
+                {"tag": "markdown", "content": "**审计结果**"},
+                {"tag": "markdown", "content": "所有测试通过"},
+            ],
+        }
+        result = _normalize_interactive_message("interactive", card)
+        self.assertEqual(result.text_content.count("审计结果"), 1)
+
+    def test_long_card_not_truncated_at_12_lines(self):
+        """Cards with >12 lines should not be hard-cut at line 12."""
+        from plugins.platforms.feishu.adapter import _normalize_interactive_message
+        elements = [{"tag": "markdown", "content": f"Line {i}"} for i in range(1, 20)]
+        card = {"elements": elements}
+        result = _normalize_interactive_message("interactive", card)
+        lines = result.text_content.split("\n")
+        self.assertEqual(len(lines), 19)
+
+    def test_huge_card_truncated_by_byte_budget(self):
+        """Cards exceeding 4000-byte budget get ...[truncated]."""
+        from plugins.platforms.feishu.adapter import _normalize_interactive_message
+        elements = [{"tag": "markdown", "content": f"Line {i}: " + "x" * 300} for i in range(50)]
+        card = {"elements": elements}
+        result = _normalize_interactive_message("interactive", card)
+        self.assertLessEqual(len(result.text_content.encode("utf-8")), 4100)
+        self.assertTrue(result.text_content.endswith("...[truncated]"))
+
+    def test_cjk_truncation_no_mojibake(self):
+        """CJK byte-boundary truncation must not split multi-byte chars."""
+        from plugins.platforms.feishu.adapter import _truncate_lines_to_byte_budget
+        lines = ["中文测试" * 500]
+        result = _truncate_lines_to_byte_budget(lines, 4000)
+        self.assertTrue(result.endswith("...[truncated]"))
+        self.assertNotIn("\ufffd", result)
+
+    def test_no_title_card_preserves_all_body(self):
+        """Card without header title: all body lines preserved, no dedup."""
+        from plugins.platforms.feishu.adapter import _normalize_interactive_message
+        card = {"elements": [{"tag": "markdown", "content": "Line A"}, {"tag": "markdown", "content": "Line B"}]}
+        result = _normalize_interactive_message("interactive", card)
+        self.assertIn("Line A", result.text_content)
+        self.assertIn("Line B", result.text_content)
+
+    def test_exact_byte_budget_not_truncated(self):
+        """Content fitting exactly within budget should not get truncated marker."""
+        from plugins.platforms.feishu.adapter import _truncate_lines_to_byte_budget
+        text = "x" * 100
+        result = _truncate_lines_to_byte_budget([text], 100)
+        self.assertNotIn("...[truncated]", result)
+        self.assertEqual(result, text)
+
+    def test_third_party_card_title_with_markdown_dedup(self):
+        """Third-party card with markdown in header title also dedups correctly."""
+        from plugins.platforms.feishu.adapter import _normalize_interactive_message
+        card = {
+            "header": {"title": {"tag": "plain_text", "content": "**报告**"}},
+            "elements": [
+                {"tag": "markdown", "content": "**报告**"},
+                {"tag": "markdown", "content": "正文"},
+            ],
+        }
+        result = _normalize_interactive_message("interactive", card)
+        count = result.text_content.count("报告")
+        self.assertEqual(count, 1, f"Expected 1, got {count}: {result.text_content!r}")
 

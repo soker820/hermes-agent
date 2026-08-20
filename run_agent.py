@@ -8367,6 +8367,11 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            agent_name=function_args.get("agent_name"),
+            timeout=function_args.get("timeout"),
+            # Patch 059: toolsets removed from model-facing schema.
+            # Operator config drives child toolsets via _get_default_toolsets().
+            toolsets=None,
             background=(not _is_subagent),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),

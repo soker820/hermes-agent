@@ -1,14 +1,11 @@
 """Tests for Feishu adapter outbound markdown payload construction.
 
-Reproduces the bug tracked in hermes-agent issue #52786:
-`_build_outbound_payload` was force-downgrading any message containing a
-markdown pipe table to ``msg_type=text``, so Feishu clients rendered the raw
-pipe-and-dash source instead of a table.  Empirically current Feishu clients
-render ``post``+``md`` tables natively, so the downgrade branch must be removed.
-
-These tests guard the fix.  They invoke the real adapter via the project's
-plugin-loader helper so that no ``sys.path`` / ``sys.modules`` games are
-needed.
+Originally reproduced hermes-agent issue #52786 (table downgrade bug).
+After the unified routing refactor (2026-07-05), the send path no longer
+produces ``post`` — it routes via feishu_card: ≤150 chars → ``text``,
+>150 chars → ``interactive`` card. These tests now guard the unified
+routing behaviour: content is never lost, tables in interactive cards
+render as native Feishu table elements.
 """
 
 from __future__ import annotations
@@ -23,67 +20,59 @@ _adapter = load_plugin_adapter("feishu")
 def _call_build_outbound_payload(content: str) -> tuple[str, str]:
     """Invoke ``_build_outbound_payload`` on a bare adapter instance.
 
-    ``_build_outbound_payload`` is a method that only uses module-level
-    helpers (``_MARKDOWN_TABLE_RE``, ``_MARKDOWN_HINT_RE``,
-    ``_build_markdown_post_payload``) and never touches ``self.*``, so a bare
-    object is sufficient.
+    Note: post routing was removed in the unified routing refactor
+    (2026-07-05); _build_outbound_payload now delegates to
+    _build_outbound_payloads → feishu_card.build_outbound_payloads.
     """
     inst = object.__new__(_adapter.FeishuAdapter)
     return inst._build_outbound_payload(content)
 
 
-def _md_texts_from_post_payload(payload_str: str) -> list[str]:
-    """Pull every ``{tag:'md', text:'...'}`` element out of a Feishu post payload.
-
-    Real payload shape::
-
-        {"zh_cn": {"content": [[{"tag": "md", "text": "..."}], ...]}}
-
-    Helpers and tests need to introspect the ``md`` blocks regardless of
-    locale, so we walk the structure generically.
-    """
-    payload = json.loads(payload_str)
-    if not isinstance(payload, dict):
-        return []
-    texts: list[str] = []
-    for lang_val in payload.values():
-        if not isinstance(lang_val, dict):
-            continue
-        content = lang_val.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, list):
-                candidates = block
-            else:
-                candidates = [block]
-            for el in candidates:
-                if isinstance(el, dict) and el.get("tag") == "md":
-                    texts.append(el.get("text", ""))
-    return texts
-
-
-def test_markdown_table_uses_post_not_text():
-    """Regression test for issue #52786 (and its older sibling #23938).
-
-    A message whose only markdown is a table must take the ``post`` path,
-    not be downgraded to plain text.
-    """
+def test_short_table_routes_to_text_with_content_preserved():
+    """A short table (≤150 chars) routes to ``text`` via feishu_card, and
+    the table data must be preserved in the plain-text output."""
     content = (
         "| col A | col B |\n"
         "| ----- | ----- |\n"
         "| 1     | 2     |"
     )
     msg_type, payload_str = _call_build_outbound_payload(content)
-    assert msg_type == "post", (
-        f"expected 'post' for a markdown table (issue #52786), got {msg_type!r}; "
-        "the table-downgrade branch in _build_outbound_payload has been re-introduced"
-    )
-    md_texts = _md_texts_from_post_payload(payload_str)
-    assert md_texts, f"post payload must include at least one md element; got {payload_str!r}"
-    joined = "".join(md_texts)
-    assert "col A" in joined and "|" in joined, (
-        "table text was lost or reformatted when switching from text to post"
-    )
+    assert msg_type == "text", f"expected 'text' for short content, got {msg_type!r}"
+    payload = json.loads(payload_str)
+    text = payload.get("text", "")
+    assert "col A" in text, f"table header lost in text output: {text!r}"
+    assert "1" in text, f"table data lost in text output: {text!r}"
 
 
+def test_plain_text_without_markdown_still_uses_text():
+    """A message with no markdown must route to plain text."""
+    msg_type, _ = _call_build_outbound_payload("just a plain sentence with no markup")
+    assert msg_type == "text"
+
+
+def test_short_heading_routes_to_text_with_heading_preserved():
+    """A short heading (≤150 chars) routes to ``text``, heading text preserved."""
+    msg_type, payload_str = _call_build_outbound_payload("# hello world\n")
+    assert msg_type == "text", f"expected 'text', got {msg_type!r}"
+    payload = json.loads(payload_str)
+    assert "hello world" in payload.get("text", "")
+
+
+def test_mixed_table_and_prose_routes_correctly():
+    """A message mixing a table with surrounding prose must route correctly
+    (≤150 chars → text, >150 → interactive) without losing content."""
+    content = (
+        "Here is the data:\n\n"
+        "| col A | col B |\n"
+        "| ----- | ----- |\n"
+        "| 1     | 2     |\n\n"
+        "Let me know."
+    )
+    msg_type, payload_str = _call_build_outbound_payload(content)
+    # Content is ~70 chars → text routing
+    assert msg_type == "text", f"expected 'text' for ~70-char content, got {msg_type!r}"
+    payload = json.loads(payload_str)
+    text = payload.get("text", "")
+    assert "Here is the data" in text, "leading prose was lost"
+    assert "col A" in text, "table header was lost"
+    assert "Let me know" in text, "trailing prose was lost"

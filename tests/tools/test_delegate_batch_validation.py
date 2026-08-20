@@ -42,8 +42,16 @@ def _make_mock_parent(depth=0):
     return parent
 
 
+_MOCK_CONFIG = {"require_agent_name": False, "agents": {}, "model": "m",
+                "provider": "openrouter", "max_concurrent_children": 6, "max_spawn_depth": 2}
+_MOCK_CREDS = {"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+               "api_key": "k", "api_mode": "chat_completions"}
+
+
 def _call(tasks):
-    return json.loads(delegate_task(tasks=tasks, parent_agent=_make_mock_parent()))
+    with patch("tools.delegate_tool._load_config", return_value=_MOCK_CONFIG), \
+         patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_MOCK_CREDS):
+        return json.loads(delegate_task(tasks=tasks, parent_agent=_make_mock_parent()))
 
 
 GOOD_A = "Refactor the login handler to use the new session helper"
@@ -153,7 +161,9 @@ class TestSingleTaskBatch(unittest.TestCase):
 
 class TestValidBatchStillRuns(unittest.TestCase):
     def test_two_distinct_goals_pass_validation(self):
-        with patch("tools.delegate_tool._run_single_child") as mock_run:
+        with patch("tools.delegate_tool._run_single_child") as mock_run, \
+             patch("tools.delegate_tool._load_config", return_value={"require_agent_name": False, "agents": {}, "model": "m", "provider": "openrouter", "max_concurrent_children": 6, "max_spawn_depth": 2}), \
+             patch("tools.delegate_tool._resolve_delegation_credentials", return_value={"model": "m", "provider": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_key": "k", "api_mode": "chat_completions"}):
             mock_run.side_effect = [
                 {"task_index": 0, "status": "completed", "summary": "A done",
                  "api_calls": 1, "duration_seconds": 1.0, "_child_role": None},

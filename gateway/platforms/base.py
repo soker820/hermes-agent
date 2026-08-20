@@ -162,8 +162,10 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu" and thread_id:
+        return (getattr(event, "reply_to_message_id", None)
+                or getattr(event, "message_id", None)
+                or thread_id)
     return getattr(event, "message_id", None)
 
 
@@ -2340,6 +2342,7 @@ class MessageEvent:
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
+    reply_to_raw_content: Optional[str] = None  # Raw content of replied-to message (for card JSON injection)
     reply_to_author_id: Optional[str] = None
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
@@ -2425,6 +2428,59 @@ class TextDebounceState:
     task: asyncio.Task | None
     first_ts: float
     last_ts: float
+
+
+# ---------------------------------------------------------------------------
+# Reply-context injection helper (Patch 060)
+# ---------------------------------------------------------------------------
+# Maximum characters of raw card content to inject into the LLM context.
+# Cards can be very large (dashboards, interactive forms); we cap to avoid
+# flooding the prompt.  8000 ASCII chars ≈ 2000 tokens; CJK content runs
+# higher (typically ~1 token/char, worst case ~2) — generous but bounded.
+REPLY_RAW_CONTENT_CAP: int = 8000
+
+
+def build_reply_context_prefix(event: "MessageEvent") -> str:
+    """Build a reply-context prefix for the LLM prompt.
+
+    Four branches:
+    1. **Interactive card** (``reply_to_raw_content`` is set) — inject the full
+       card JSON payload (capped at ``REPLY_RAW_CONTENT_CAP`` chars) so the
+       agent can read and reference card content when replying.
+    2. **Plain text reply** — inject ``[Replying to "..."]`` with a truncated
+       snippet of the replied-to text.
+    3. **Own-message reply** — inject ``[Replying to your previous message: "..."]``
+       so the agent knows it's continuing its own thread.
+    4. **No context** — return ``""`` (no prefix).
+
+    Returns:
+        A string to prepend to ``message_text``, or ``""`` if no reply context.
+    """
+    reply_id = getattr(event, "reply_to_message_id", None)
+    if not reply_id:
+        return ""
+
+    raw_content = getattr(event, "reply_to_raw_content", None)
+    reply_text = getattr(event, "reply_to_text", None)
+    is_own = getattr(event, "reply_to_is_own_message", False)
+
+    # Branch 1: Card JSON injection (highest fidelity)
+    if raw_content:
+        truncated = raw_content[:REPLY_RAW_CONTENT_CAP]
+        truncation = "...[truncated]" if len(raw_content) > REPLY_RAW_CONTENT_CAP else ""
+        return (
+            "[The user is replying to a card message. "
+            f"Card content:\n{truncated}{truncation}]\n\n"
+        )
+
+    # Branch 2/3: Plain text reply
+    if reply_text:
+        snippet = reply_text[:500]
+        if is_own:
+            return f'[Replying to your previous message: "{snippet}"]\n\n'
+        return f'[Replying to: "{snippet}"]\n\n'
+
+    return ""
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (

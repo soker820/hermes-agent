@@ -1696,12 +1696,13 @@ class TerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
+async def test_terminal_progress_renders_single_line_preview(monkeypatch, tmp_path):
     """Terminal progress on a markdown-capable (supports_code_blocks) gateway
-    renders a bare fenced code block — no language tag (Slack mrkdwn would print
-    'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
-    command is collapsed to a single line capped at tool_preview_length so a long
-    or multi-line command doesn't render as a huge block (#42634)."""
+    renders a single-line ``💻 Running <cmd>`` preview (Patch 065) — same as
+    every other tool.  The upstream fenced-code-block branch is disabled; in
+    non-verbose ("all"/"new") mode the preview is capped at
+    tool_preview_length so a long or multi-line command doesn't blow up the
+    line (#42634)."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1738,24 +1739,32 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     assert result["final_response"] == "done"
     all_content = " ".join(call["content"] for call in adapter.sent)
     all_content += " ".join(call["content"] for call in adapter.edits)
-    # Bare fenced block, no language tag (no '```bash').
-    assert "```" in all_content
+    # Patch 065: no fenced code block — single-line preview instead.
+    assert "```" not in all_content
     assert "```bash" not in all_content
-    # Non-verbose collapses to the first line + truncation marker — the later
-    # command lines must NOT appear (this was the "huge block" regression).
-    assert "set -euo pipefail" in all_content
+    # summarize_shell_command() filters silent heads (set/printf/export…),
+    # so the preview starts from the first non-silent segment ("node --version"),
+    # not the raw first line ("set -euo pipefail").  Later segments must NOT
+    # appear (the "huge block" regression guard).
+    assert "set -euo pipefail" not in all_content
+    assert "node --version" in all_content
     assert "npm install -g hyperframes@latest" not in all_content
-    assert "node --version" not in all_content
-    # No truncated quoted preview for the terminal command.
+    # No quoted preview fallback either.
     assert 'terminal: "' not in all_content
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
-    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
-    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
+async def test_terminal_progress_verbose_shows_full_command_args(monkeypatch, tmp_path):
+    """Verbose mode on a markdown-capable gateway shows the FULL command in the
+    args detail line (Patch 065) — the fenced block is disabled for terminal,
+    and verbose renders ``💻 terminal(['command'])`` + full JSON args like any
+    other tool.  No truncation in verbose (tool_preview_length=0 default)."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
+    # Verbose means full detail: pin tool_preview_length to 0 (unlimited) via
+    # the gateway config so _run_agent's display-config application doesn't
+    # re-apply the platform tier default (40) and truncate the args line.
+    from agent.display import set_tool_preview_max_len
+    set_tool_preview_max_len(0)
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -1770,6 +1779,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"display": {"tool_preview_length": 0}})
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     source = SessionSource(
@@ -1791,9 +1801,10 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     assert result["final_response"] == "done"
     all_content = " ".join(call["content"] for call in adapter.sent)
     all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```" in all_content
+    # Patch 065: no fenced code block in verbose either.
+    assert "```" not in all_content
     assert "```bash" not in all_content
-    # Full command body present — verbose is uncapped.
+    # Full command body present in the args detail — verbose is uncapped.
     assert "npm install -g hyperframes@latest" in all_content
     assert "node --version" in all_content
 
@@ -1861,10 +1872,10 @@ class MultiTerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_path):
-    """Back-to-back terminal calls render ONE "terminal" header followed by
-    adjacent code blocks; a different tool in between resets the header so the
-    next terminal call gets a fresh one."""
+async def test_consecutive_terminal_progress_single_line_each(monkeypatch, tmp_path):
+    """Back-to-back terminal calls each render their own single-line
+    ``💻 Running <cmd>`` preview (Patch 065) — no header collapsing, no
+    fenced blocks."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1903,12 +1914,12 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
         call["content"] for call in adapter.edits
     ]
     final = max(contents, key=len) if contents else ""
-    # All four commands present as code blocks.
+    # Patch 065: all four commands present as single-line previews.
     for cmd in ("echo one", "echo two", "echo three", "echo four"):
         assert cmd in final
-    # Exactly TWO terminal headers: one for the first run of three calls,
-    # one for the terminal call after web_search broke the streak.
-    assert final.count("terminal\n```") == 2
+    # No fenced code blocks anymore; one "Running" line per terminal call.
+    assert "```" not in final
+    assert final.count("Running") == 4
 
 
 class TestSlackReplyInThreadProgressRouting:

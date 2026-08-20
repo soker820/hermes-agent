@@ -2595,6 +2595,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    build_reply_context_prefix,
     merge_pending_message_event,
     utf16_len,
 )
@@ -4374,8 +4375,17 @@ class TurnRunner:
             _progress_adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             _progress_adapter = None
+        # Patch 065 (2026-07-31): terminal tool-progress notifications stay on
+        # the single-line preview path (``💻 Running <cmd>``) like every other
+        # tool.  The upstream code-block branch renders terminal as a fenced
+        # block (header + command on separate lines) on markdown platforms,
+        # which breaks the one-line notification on Feishu.  The ``and False``
+        # short-circuits that branch; the rest of the condition is kept so a
+        # future refactor that drops the short-circuit is caught by
+        # verify-patches.sh (grep "False  # Patch 065").
         if (
-            getattr(_progress_adapter, "supports_code_blocks", False)
+            False  # Patch 065: terminal notifications stay on the single-line preview (no fenced code block)
+            and getattr(_progress_adapter, "supports_code_blocks", False)
             and tool_name == "terminal"
             and isinstance(args, dict)
             and isinstance(args.get("command"), str)
@@ -18279,21 +18289,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            if getattr(event, "reply_to_is_own_message", False):
-                message_text = (
-                    f'[Replying to your previous message: "{reply_snippet}"]\n\n'
-                    f"{message_text}"
-                )
-            else:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+        # Patch 060: Use build_reply_context_prefix helper instead of inline logic.
+        # Guard expanded to check reply_to_text OR reply_to_raw_content (card
+        # scenarios where reply_to_text may be empty).
+        _reply_prefix = build_reply_context_prefix(event)
+        if _reply_prefix:
+            message_text = _reply_prefix + message_text
 
         if "@" in message_text:
             try:

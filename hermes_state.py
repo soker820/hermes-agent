@@ -3428,6 +3428,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
+                # Performance tuning for large databases (123MB+)
+                # cache_size=-65536 → 64MB in-memory page cache (default is
+                # 2MB; negative values are in KiB)
+                # mmap_size=256MB → memory-mapped I/O for faster reads
+                self._conn.execute("PRAGMA cache_size=-65536")
+                self._conn.execute("PRAGMA mmap_size=268435456")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 

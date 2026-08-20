@@ -706,3 +706,86 @@ class TestBomToleranceInMemoryFiles:
         raw, read_ok = MemoryStore._read_raw_checked(path)
         assert read_ok is False
         assert raw == ""
+
+
+# =========================================================================
+# Recall (dual-store search)
+#
+# memory_tool preserves the original `target` as `_recall_target` before
+# normalizing None→"memory" (commit d6998245a), so store.recall() receives
+# None and searches BOTH stores.  target="memory"/"user" stays single-store.
+# The tests below pin both paths.
+# =========================================================================
+
+class TestMemoryStoreRecall:
+    def test_recall_searches_both_stores_when_target_none(self, store):
+        """target=None → dual-store search (commit d6998245a).
+
+        Strict providers send ``target: null`` for recall; normalizing it to
+        "memory" would silently skip the user store. ``_recall_target`` keeps
+        the original None so store.recall sees both stores.
+        """
+        store.add("memory", "recall-dual-marker-memory")
+        store.add("user", "recall-dual-marker-user")
+        # store.recall(query, target=None) → searches ["memory", "user"]
+        results = store.recall("recall-dual-marker", None)
+        targets_hit = {r["target"] for r in results}
+        assert targets_hit == {"memory", "user"}, (
+            f"target=None should search both stores, got {targets_hit!r}"
+        )
+
+    def test_recall_single_store_when_target_specified(self, store):
+        """target="memory" → single-store search only."""
+        store.add("memory", "recall-single-marker")
+        store.add("user", "recall-single-marker")  # same text in user store
+        results = store.recall("recall-single-marker", "memory")
+        targets_hit = {r["target"] for r in results}
+        assert targets_hit == {"memory"}, (
+            f"target='memory' should only search memory store, got {targets_hit!r}"
+        )
+
+    def test_recall_preserves_target_field_in_results(self, store):
+        """Each result dict carries the `target` it came from (contract)."""
+        store.add("memory", "contract-check-mem")
+        store.add("user", "contract-check-user")
+        results = store.recall("contract-check", None)
+        # Every result must have a "target" key that's either memory or user
+        for r in results:
+            assert r["target"] in {"memory", "user"}
+            assert "index" in r and "content" in r
+
+
+class TestMemoryToolRecallDualStore:
+    """End-to-end: memory_tool(action=recall) routes target=None to dual-store."""
+
+    def test_recall_action_with_null_target_searches_both(self, store):
+        store.add("memory", "e2e-dual-marker-memory")
+        store.add("user", "e2e-dual-marker-user")
+        raw = memory_tool(
+            action="recall",
+            content="e2e-dual-marker",
+            target=None,  # simulates strict provider sending JSON null
+            store=store,
+        )
+        data = json.loads(raw)
+        assert data["success"] is True
+        targets_hit = {m["target"] for m in data["matches"]}
+        assert targets_hit == {"memory", "user"}, (
+            f"target=None recall should hit both stores, got {targets_hit!r}"
+        )
+
+    def test_recall_action_with_explicit_memory_target(self, store):
+        store.add("memory", "e2e-single-marker")
+        store.add("user", "e2e-single-marker")
+        raw = memory_tool(
+            action="recall",
+            content="e2e-single-marker",
+            target="memory",
+            store=store,
+        )
+        data = json.loads(raw)
+        targets_hit = {m["target"] for m in data["matches"]}
+        assert targets_hit == {"memory"}, (
+            f"target='memory' recall should only hit memory store, got {targets_hit!r}"
+        )
+

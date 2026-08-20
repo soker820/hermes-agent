@@ -95,6 +95,7 @@ CreateImageRequest = None  # type: ignore[assignment]
 CreateImageRequestBody = None  # type: ignore[assignment]
 CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
+DeleteMessageRequest = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -132,6 +133,12 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
+from gateway.platforms.feishu_card import (
+    build_outbound_payloads as _fc_build_outbound_payloads,
+    strip_markdown as _fc_strip_markdown,
+    _truncate_to_bytes as _fc_truncate_to_bytes,
+)
+from gateway.platforms.feishu_card import CARD_LENGTH_THRESHOLD
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, env_float, env_int
 
@@ -165,35 +172,15 @@ logger = logging.getLogger(__name__)
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-_MARKDOWN_HINT_RE = re.compile(
-    # Pipe table: any header line + separator line both starting with '|'.
-    r"(^\|.*\|\s*\n\|[-:|\s]+\|)"
-    # Headings, lists, code, bold/italic/strike/underline, links, blockquotes.
-    r"|(^#{1,6}\s)"
-    r"|(^\s*[-*]\s)"
-    r"|(^\s*\d+\.\s)"
-    r"|(^\s*---+\s*$)"
-    r"|(```)"
-    r"|(`[^`\n]+`)"
-    r"|(\*\*[^*\n].+?\*\*)"
-    r"|(~~[^~\n].+?~~)"
-    r"|(<u>.+?</u>)"
-    r"|(\*[^*\n]+\*)"
-    r"|(\[[^\]]+\]\([^)]+\))"
-    r"|(^>\s)",
-    re.MULTILINE,
-)
-# Backwards-compatible alias retained because external callers reference it.
-_MARKDOWN_TABLE_RE = re.compile(r"^\|.*\|\n\|[-|: ]+\|", re.MULTILINE)
-_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
-_MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
-# ---------------------------------------------------------------------------
-# Media type sets and upload constants
-# ---------------------------------------------------------------------------
+# Match the closing ">" of an opening <card ...> tag, correctly skipping
+# ">" characters inside quoted attribute values (e.g. <card title="a > b">).
+_CARD_TAG_CLOSE_RE = re.compile(r'<card\b(?:\s+\w+="[^"]*")*\s*>')
+
+# Post payload builders and parsers
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".opus", ".webm"}
@@ -269,7 +256,7 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
 
 
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
-_FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+_FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003, 99992402})  # reply target withdrawn/missing + field validation failed
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -282,6 +269,16 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+_FEISHU_RAW_CARD_CACHE_SIZE = 128           # LRU cap for raw card content (each entry up to ~28 KB)
+
+
+def _lru_set_and_evict(cache: "OrderedDict", key: str, value, max_size: int) -> None:
+    """Set *cache[key] = value*, mark it most-recently-used, then evict oldest entries until len ≤ max_size."""
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -555,19 +552,10 @@ def _render_code_block_element(element: Dict[str, Any]) -> str:
 def _strip_markdown_to_plain_text(text: str) -> str:
     """Strip markdown formatting to plain text for Feishu text fallbacks.
 
-    Delegates common markdown stripping to the shared helper and adds
-    Feishu-specific patterns (blockquotes, strikethrough, underline tags,
-    horizontal rules, \\r\\n normalisation).
+    Uses the same ``feishu_card.strip_markdown`` as the text routing path so
+    that fallback output is identical to what ≤150-char messages produce.
     """
-    from gateway.platforms.helpers import strip_markdown
-    plain = text.replace("\r\n", "\n")
-    plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
-    plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
-    plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
-    plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
-    plain = strip_markdown(plain)
-    return plain
+    return _fc_strip_markdown(text)
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -973,6 +961,21 @@ def _normalize_share_chat_message(payload: Dict[str, Any]) -> FeishuNormalizedMe
     )
 
 
+def _truncate_lines_to_byte_budget(lines: List[str], max_bytes: int) -> str:
+    """Join lines into a single string, truncating at a UTF-8 byte boundary.
+
+    Adds ``...[truncated]`` when content exceeds the budget. Delegates the
+    UTF-8-safe truncation to ``feishu_card._truncate_to_bytes`` to avoid a
+    second walk-back implementation.
+    """
+    joined = "\n".join(lines)
+    truncated = _fc_truncate_to_bytes(joined, max_bytes)
+    if truncated == joined:
+        return joined.strip()
+    # Truncation can leave only whitespace; then fall back to generic text.
+    return (truncated + "...[truncated]").strip() or FALLBACK_INTERACTIVE_TEXT
+
+
 def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -> FeishuNormalizedMessage:
     card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
     title = _first_non_empty_text(
@@ -986,13 +989,22 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
     lines: List[str] = []
     if title:
         lines.append(title)
+    # Dedup: compare strip_markdown() on both sides so that header title
+    # "审计结果" (plain text in the card header, stripped by the outbound
+    # card builder) correctly matches body line "**审计结果**" (unstripped
+    # markdown). Without this, the raw comparison line != title fails and
+    # the title appears twice.
+    title_normalized = _strip_markdown_to_plain_text(title) if title else ""
     for line in body_lines:
-        if line != title:
+        if _strip_markdown_to_plain_text(line) != title_normalized:
             lines.append(line)
     if actions:
         lines.append(f"Actions: {', '.join(actions)}")
 
-    text_content = "\n".join(lines[:12]).strip() or FALLBACK_INTERACTIVE_TEXT
+    # Cap by byte budget instead of a fixed line count so that long cards
+    # (>12 lines) are not silently truncated. 4000 ASCII chars ≈ 1000 tokens
+    # (CJK ~4000) — generous but bounded, at half the reply-context cap.
+    text_content = _truncate_lines_to_byte_budget(lines, 4000) or FALLBACK_INTERACTIVE_TEXT
     return FeishuNormalizedMessage(
         raw_type=message_type,
         text_content=text_content,
@@ -1400,6 +1412,7 @@ def _load_lark_oapi() -> bool:
                 CreateFileRequest, CreateFileRequestBody,
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
+                DeleteMessageRequest,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
@@ -1425,6 +1438,7 @@ def _load_lark_oapi() -> bool:
             "CreateImageRequestBody": CreateImageRequestBody,
             "CreateMessageRequest": CreateMessageRequest,
             "CreateMessageRequestBody": CreateMessageRequestBody,
+            "DeleteMessageRequest": DeleteMessageRequest,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
@@ -1542,6 +1556,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        self._message_raw_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1945,6 +1960,28 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    async def _send_text_fallback(
+        self, *, chat_id: str, chunk: str,
+        reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Send *chunk* as plain text after a post/interactive payload was rejected."""
+        return await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="text",
+            payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _is_text_fallback_needed(msg_type: str) -> bool:
+        """Whether a failed send should fall back to plain text.
+
+        interactive: any failure → fallback.
+        text/others: never (nothing simpler to fall back to).
+        """
+        return msg_type == "interactive"
+
     async def send(
         self,
         chat_id: str,
@@ -1958,59 +1995,97 @@ class FeishuAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-        # When chunking splits a long markdown response, an individual chunk
-        # can end up as plain prose that doesn't match the per-chunk hint
-        # regex — so it would be sent as ``msg_type=text`` and the user would
-        # see literal ``**bold``/``## heading``/code fences in the Feishu
-        # client while other chunks render correctly. Lock the markdown
-        # decision at the whole-message level so every chunk consistently
-        # uses ``post``. See #26841.
-        prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(
-                    chunk, prefer_post=prefer_post,
-                )
-                try:
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type=msg_type,
-                        payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                payloads = self._build_outbound_payloads(chunk)
+                chunk_had_success = False  # track if any card in this chunk succeeded
+                for msg_type, payload in payloads:
+                    # 1) Attempt the original send
+                    try:
+                        response = await self._feishu_send_with_retry(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=reply_to,
+                            metadata=metadata,
+                        )
+                    except Exception as exc:
+                        if self._is_text_fallback_needed(msg_type):
+                            # Only fall back if no card in this chunk has been
+                            # sent yet; otherwise re-falling-back would resend
+                            # the entire chunk (including already-delivered cards).
+                            if chunk_had_success:
+                                logger.warning(
+                                    "[Feishu] %s payload rejected (%s) after partial send; "
+                                    "skipping text fallback to avoid duplicate content",
+                                    msg_type, str(exc)[:200],
+                                )
+                                break
+                            logger.warning(
+                                "[Feishu] %s payload rejected (%s); falling back to plain text",
+                                msg_type, str(exc)[:200],
+                            )
+                            last_response = await self._send_text_fallback(
+                                chat_id=chat_id, chunk=chunk, reply_to=reply_to, metadata=metadata,
+                            )
+                            break  # entire chunk already sent as text — skip remaining cards
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                last_response = response
+
+                    # 2) API accepted the request but returned non-success (soft failure)
+                    if not self._response_succeeded(response) and self._is_text_fallback_needed(msg_type):
+                        if chunk_had_success:
+                            logger.warning(
+                                "[Feishu] %s payload rejected by API response after partial send; "
+                                "skipping text fallback to avoid duplicate content",
+                                msg_type,
+                            )
+                            break
+                        logger.warning(
+                            "[Feishu] %s payload rejected by API response; falling back to plain text",
+                            msg_type,
+                        )
+                        last_response = await self._send_text_fallback(
+                            chat_id=chat_id, chunk=chunk, reply_to=reply_to, metadata=metadata,
+                        )
+                        break  # entire chunk already sent as text — skip remaining cards
+                    last_response = response
+                    chunk_had_success = True
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Feishu edit_message degrades interactive cards to plain text (PUT
+        API limitation).  When the final content would route to a card
+        (len > 150), prefer fresh-final to preserve card formatting."""
+        return len(content) > CARD_LENGTH_THRESHOLD
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete (recall) a Feishu message via im.v1.message.delete."""
+        if not self._client or not message_id:
+            return False
+        try:
+            request = DeleteMessageRequest.builder().message_id(message_id).build()
+            response = await self._run_blocking(self._client.im.v1.message.delete, request)
+            if response and getattr(response, "success", lambda: False)():
+                return True
+            logger.debug("[Feishu] delete_message failed: %s", getattr(response, "msg", ""))
+            return False
+        except Exception:
+            logger.debug("[Feishu] delete_message error for %s", message_id, exc_info=True)
+            return False
 
     async def edit_message(
         self,
@@ -2031,15 +2106,6 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
-                )
-                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await self._run_blocking(self._client.im.v1.message.update, fallback_request)
-                result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
             return result
@@ -3229,11 +3295,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return False
 
     def _remember_processing_reaction(self, message_id: str, reaction_id: str) -> None:
-        cache = self._pending_processing_reactions
-        cache[message_id] = reaction_id
-        cache.move_to_end(message_id)
-        while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
-            cache.popitem(last=False)
+        _lru_set_and_evict(self._pending_processing_reactions, message_id, reaction_id, _FEISHU_PROCESSING_REACTION_CACHE_SIZE)
 
     def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
         return self._pending_processing_reactions.pop(message_id, None)
@@ -3354,6 +3416,7 @@ class FeishuAdapter(BasePlatformAdapter):
             or None
         )
         reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_raw_content = self._message_raw_cache.get(reply_to_message_id) if reply_to_message_id else None
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -3396,6 +3459,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            reply_to_raw_content=reply_to_raw_content,
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
@@ -4281,6 +4345,10 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
         if message_id in self._message_text_cache:
             self._message_text_cache.move_to_end(message_id)
+            # [AUTO-SOURCE-FIX] keep raw_cache entry in sync so reply_to_raw_content
+            # doesn't go stale when raw_cache (128) evicts before text_cache (512).
+            if message_id in self._message_raw_cache:
+                self._message_raw_cache.move_to_end(message_id)
             return self._message_text_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
@@ -4296,17 +4364,92 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
-                raw_content=raw_content,
-                mentions=parent_mentions,
-            )
-            self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
+
+            # For interactive/card messages, the Feishu SDK may return a
+            # degraded body.content (e.g. "请升级至最新版本客户端，以查看内容")
+            # when the card uses Card 2.0 features the SDK doesn't support.
+            # lark-cli's +messages-mget renders the full card content via its
+            # own card rendering engine, so we use it as a fallback for
+            # interactive messages to get the complete readable text.
+            if msg_type in ("interactive", "card"):
+                lark_cli_text = await self._fetch_card_text_via_lark_cli(message_id)
+                if lark_cli_text:
+                    # Use lark-cli's rendered text as both the display text
+                    # and the raw_content for reply_to_raw_content injection.
+                    text = lark_cli_text
+                    _lru_set_and_evict(self._message_raw_cache, message_id, lark_cli_text, _FEISHU_RAW_CARD_CACHE_SIZE)
+                else:
+                    # lark-cli fallback failed — use SDK raw_content as before
+                    text = self._extract_text_from_raw_content(
+                        msg_type=msg_type,
+                        raw_content=raw_content,
+                        mentions=parent_mentions,
+                    )
+                    if raw_content:
+                        _lru_set_and_evict(self._message_raw_cache, message_id, raw_content, _FEISHU_RAW_CARD_CACHE_SIZE)
+            else:
+                text = self._extract_text_from_raw_content(
+                    msg_type=msg_type,
+                    raw_content=raw_content,
+                    mentions=parent_mentions,
+                )
+
+            _lru_set_and_evict(self._message_text_cache, message_id, text, _FEISHU_MESSAGE_TEXT_CACHE_SIZE)
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
+            return None
+
+    async def _fetch_card_text_via_lark_cli(self, message_id: str) -> Optional[str]:
+        """Fetch interactive card content via lark-cli, which renders the full
+        card content (bypassing the SDK's degraded body.content for Card 2.0
+        messages). Returns the <card>...</card> markdown text, or None on
+        any failure (caller falls back to SDK raw_content).
+        """
+        import shutil as _shutil
+        if not _shutil.which("lark-cli"):
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "lark-cli", "im", "+messages-mget",
+                "--message-ids", message_id,
+                "--as", "bot",
+                "--format", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return None
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            # lark-cli may prepend WARN lines before JSON
+            idx = stdout.find("{")
+            if idx < 0:
+                return None
+            data = json.loads(stdout[idx:])
+            if not data.get("ok"):
+                return None
+            messages = data.get("data", {}).get("messages", [])
+            if not messages:
+                return None
+            content = messages[0].get("content", "")
+            if not content:
+                return None
+            # lark-cli returns <card title="...">...\n</card> — strip tags.
+            # Use regex to find the closing ">" of the opening tag, correctly
+            # handling ">" characters inside attribute values (e.g. title="a > b").
+            if content.startswith("<card") and "</card>" in content:
+                end = content.rfind("</card>")
+                open_tag_end = _CARD_TAG_CLOSE_RE.search(content[:end])
+                if open_tag_end:
+                    inner = content[open_tag_end.end():end].strip()
+                    return inner if inner else None
+            return content
+        except Exception:
+            logger.debug("[Feishu] lark-cli card fetch failed for %s", message_id, exc_info=True)
             return None
 
     def _extract_text_from_raw_content(
@@ -4638,24 +4781,40 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(
-        self, content: str, *, prefer_post: bool = False,
-    ) -> tuple[str, str]:
-        # Empirically (issue #52786), current Feishu clients render markdown
-        # tables inside ``post``-type ``md`` elements natively. The previous
-        # table-downgrade branch forced any table-containing message to
-        # ``text``, which left Feishu readers seeing the raw pipe-and-dash
-        # source instead of a rendered table. Trust the common markdown path
-        # for table content too.
-        #
-        # ``prefer_post`` lets ``send`` treat the chunk as part of a larger
-        # markdown document: when a long markdown reply is split at
-        # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
-        # mis-classify a plain-prose chunk as ``text``. See #26841.
-        if prefer_post or _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        text_payload = {"text": content}
-        return "text", json.dumps(text_payload, ensure_ascii=False)
+    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+        """Build single outbound payload (for edit_message via PUT API).
+
+        The PUT message.update API only supports text and post types — not
+        interactive cards.  So if feishu_card routing produces an interactive
+        payload (single or multiple cards), we degrade to plain text here.
+        """
+        payloads = self._build_outbound_payloads(content)
+        if payloads and payloads[0][0] == "text":
+            return payloads[0]
+        # interactive (single or multi-card) — PUT API can't update cards.
+        # Fall back to plain text to avoid a guaranteed API rejection.
+        # [AUTO-SOURCE-FIX] downgraded to debug — this fires on every
+        # progress edit when accumulated tool lines exceed 150 chars; it's
+        # expected behaviour, not an error.
+        logger.debug("[Feishu] edit_message: interactive content degraded to plain text (PUT API does not support cards)")
+        return ("text", json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False))
+
+    def _build_outbound_payloads(self, content: str) -> list[tuple[str, str]]:
+        """Build all outbound payloads via feishu_card routing.
+
+        Delegates to feishu_card.build_outbound_payloads for the three-tier
+        routing decision (≤150→text, >150→card, >300→card+header), then
+        wraps text payloads in JSON for the Feishu API.
+        """
+        raw_payloads = _fc_build_outbound_payloads(content)
+        result = []
+        for msg_type, raw_content in raw_payloads:
+            if msg_type == "text":
+                result.append(("text", json.dumps({"text": raw_content}, ensure_ascii=False)))
+            else:
+                # interactive: raw_content is already a card JSON string
+                result.append(("interactive", raw_content))
+        return result
 
     @staticmethod
     def _get_audio_duration_ms(file_path: str) -> int:
@@ -5013,20 +5172,24 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
+                        # Distinguish field validation failure from withdrawn/missing reply target
+                        reply_reason = "field validation failed" if code == 99992402 else "message withdrawn/missing"
                         if (metadata or {}).get("thread_id"):
                             logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
+                                "[Feishu] Reply to %s failed in thread %s (code %s — %s); "
                                 "skipping top-level fallback to avoid creating a new topic",
                                 active_reply_to,
                                 (metadata or {}).get("thread_id"),
                                 code,
+                                reply_reason,
                             )
                             return response
                         logger.warning(
-                            "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
+                            "[Feishu] Reply to %s failed (code %s — %s); "
                             "falling back to new message in chat %s",
                             active_reply_to,
                             code,
+                            reply_reason,
                             chat_id,
                         )
                         active_reply_to = None
@@ -5041,6 +5204,9 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    raise
+                if msg_type == "interactive":
+                    # Card format/schema errors are deterministic — retry won't help.
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
@@ -5687,7 +5853,6 @@ def interactive_setup() -> None:
         print_info,
         print_success,
         print_warning,
-        print_error,
     )
 
     print_header("Feishu / Lark")

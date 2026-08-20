@@ -1032,6 +1032,36 @@ def _get_inherit_mcp_toolsets() -> bool:
     return is_truthy_value(cfg.get("inherit_mcp_toolsets"), default=True)
 
 
+def _get_default_toolsets() -> Optional[List[str]]:
+    """Read delegation.default_toolsets from config.
+
+    Three-state semantics:
+    - Key absent (default) → ``["review"]`` (minimum privilege: read_file +
+      search_files + session_search).  This is the safest default — subagents
+      get read-only access unless the operator explicitly opts in.
+    - Explicit ``null`` / ``"inherit"`` → ``None`` (parent-inherit, legacy
+      behaviour where the child inherits the parent's full toolset).
+    - Explicit list (e.g. ``["file", "terminal"]``) → that exact list.
+
+    Returns:
+        ``["review"]`` when the key is absent, ``None`` for parent-inherit,
+        or the operator-supplied list.
+    """
+    cfg = _load_config()
+    if "default_toolsets" not in cfg:
+        return ["review"]  # minimum privilege default
+    val = cfg.get("default_toolsets")
+    if val is None or val == "inherit":
+        return None  # parent-inherit
+    if isinstance(val, list):
+        return val
+    logger.warning(
+        "delegation.default_toolsets=%r is not a valid value; "
+        "using default ['review']",
+        val,
+    )
+    return ["review"]
+
 def _is_mcp_toolset_name(name: str) -> bool:
     """Return True for canonical MCP toolsets and their registered aliases."""
     if not name:
@@ -1178,6 +1208,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    agent_name: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -1187,8 +1218,12 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
+    if agent_name:
+        identity_line = f"You are {agent_name}, a focused subagent working on a specific delegated task."
+    else:
+        identity_line = "You are a focused subagent working on a specific delegated task."
     parts = [
-        "You are a focused subagent working on a specific delegated task.",
+        identity_line,
         "",
         f"YOUR TASK:\n{goal}",
     ]
@@ -1245,6 +1280,15 @@ def _build_child_system_prompt(
             f"NOTE: You are at depth {child_depth}. The delegation tree "
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
+    # Inject subagent protocol (SUBAGENT_PROTOCOL.md) if present
+    try:
+        from hermes_constants import get_hermes_home
+        sub_path = get_hermes_home() / "SUBAGENT_PROTOCOL.md"
+        if sub_path.is_file():
+            sub_content = sub_path.read_text(encoding="utf-8")
+            parts.append(f"\n---\n## Subagent Protocol\n{sub_content}")
+    except (OSError, ValueError):
+        pass  # SUBAGENT_PROTOCOL.md missing/unreadable/non-UTF-8 — subagent runs without it
     return "\n".join(parts)
 
 
@@ -1598,6 +1642,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    agent_name: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1652,8 +1697,10 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks.
+    if toolsets is not None:
+        # Explicit toolsets provided — intersect with parent so subagent
+        # cannot gain tools the parent lacks.  An empty list [] means
+        # "no tools" (pure reasoning); None means "use default review".
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
@@ -1663,12 +1710,36 @@ def _build_child_agent(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
-    elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
-    elif parent_toolsets:
-        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:
-        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
+        # Operator-configurable default (Patch 059).
+        # When no explicit toolsets given, read delegation.default_toolsets
+        # from config. Three states: absent → ["review"] (read-only),
+        # null/inherit → parent-inherit, list → that exact list.
+        default_ts = _get_default_toolsets()
+        if default_ts is None:
+            # Parent-inherit mode: use parent's full toolset
+            child_toolsets = _strip_blocked_tools(list(parent_toolsets))
+        else:
+            # Explicit list (["review"] by default). Intersect with parent
+            # so subagent cannot gain tools the parent lacks — same security
+            # boundary as the explicit-toolsets branch above.
+            expanded_parent = _expand_parent_toolsets(parent_toolsets)
+            child_toolsets = _strip_blocked_tools(
+                [t for t in default_ts if t in expanded_parent]
+            )
+
+    # Output-file whitelist (Patch 072, formerly P060): when the task goal
+    # references a /tmp/batch_*/ output path, inject the "file" toolset so
+    # the subagent can write_file its analysis conclusion.  This fulfils the
+    # HERMES §2.2 "output-file exception" contract that was previously unenforced at
+    # the tool layer.  The subagent's goal-level 【禁止】 still constrains
+    # writes to the declared output path; the toolset grant only makes
+    # write_file *available*, not unrestricted.
+    if goal and _OUTPUT_FILE_WHITELIST_RE.search(goal):
+        if "file" not in child_toolsets:
+            expanded_parent_check = _expand_parent_toolsets(parent_toolsets)
+            if "file" in expanded_parent_check or not expanded_parent_check:
+                child_toolsets.append("file")
 
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
@@ -1707,6 +1778,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        agent_name=agent_name,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -2348,7 +2420,21 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # Patch 070: use the compressor's LAST ACTUAL prompt size (the real
+        # current-context usage), not the session-cumulative counter.
+        # session_prompt_tokens is a lifetime accumulator (agent_init=0, then
+        # += per API call, never reset) — treating it as "current usage" makes
+        # headroom permanently negative on any long session, starving every
+        # batch summary down to the 2000-char floor regardless of how small
+        # the live context actually is. last_prompt_tokens is the latest real
+        # provider prompt count; fall back to last_real_prompt_tokens when it
+        # is 0/-1 (right after a compression boundary), then to the cumulative
+        # counter as a last resort.
+        used_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            used_tokens = getattr(compressor, "last_real_prompt_tokens", 0) or 0
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 
@@ -2421,6 +2507,34 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
             cap,
             spill_path or "none",
         )
+
+
+def _safe_timeout_override(raw_timeout) -> Optional[float]:
+    """Convert a raw timeout value to float, returning None on failure.
+
+    LLMs occasionally pass non-numeric values (strings, objects) despite the
+    schema declaring ``number``. A bare ``float()`` would crash the entire
+    delegation call; this helper degrades gracefully by falling back to the
+    global default (None → _get_child_timeout).
+    """
+    if raw_timeout is None:
+        return None
+    # Reject bool explicitly: float(True) == 1.0 would silently pass numeric
+    # checks and create a spurious 1-second timeout.  LLMs occasionally pass
+    # ``true``/``false`` despite the schema declaring ``number``.
+    if isinstance(raw_timeout, bool):
+        logger.warning("delegate_task: timeout_override=%r is bool, ignoring", raw_timeout)
+        return None
+    try:
+        import math
+        val = float(raw_timeout)
+        if math.isnan(val) or math.isinf(val) or val <= 0:
+            logger.warning("delegate_task: timeout_override=%r is NaN/Inf/<=0, ignoring", raw_timeout)
+            return None
+        return val
+    except (TypeError, ValueError):
+        logger.warning("delegate_task: timeout_override=%r is not numeric, ignoring", raw_timeout)
+        return None
 
 
 def _run_single_child(
@@ -2754,7 +2868,10 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Per-task timeout_override (from tasks[] batch mode) takes precedence
+        # over the global delegation.child_timeout_seconds.
+        _timeout_override = _kwargs.get("timeout_override")
+        child_timeout = _timeout_override if _timeout_override is not None else _get_child_timeout()
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -3605,6 +3722,9 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    timeout: Optional[float] = None,
+    toolsets: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3655,6 +3775,8 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+
+    logger.debug("delegate_task ENTRY: agent_name=%r (None/empty → delegation defaults: default_agent, else parent model; role_bindings skipped)", agent_name)
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3730,9 +3852,17 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal, "context": context, "role": top_role, "agent_name": agent_name,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        # Surface top-level timeout into the single-task dict so
+        # _execute_and_aggregate picks it up exactly like batch items.
+        # Note: toolsets removed from model-facing schema (Patch 059);
+        # operator config drives child toolsets via _get_default_toolsets().
+        if timeout is not None:
+            single_task["timeout"] = timeout
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -3822,13 +3952,89 @@ def delegate_task(
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
-    # toolset resolution never leaks into the parent (shared with the plugin
-    # subagent-lifecycle API).
+    # toolset resolution never leaks into the parent.
+    # Load agents_config and role_bindings for agent_name routing.
+    agents_config = cfg.get("agents", {})
+    role_bindings = cfg.get("role_bindings", {})
+
+    # --- All-hands count gate (HERMES §1.1 协作表 collaboration-table triggers) --------
+    # Patch: all-hands-count-gate
+    # When the latest user message contains an all-hands trigger phrase,
+    # require ≥4 tasks. This catches the "讨论一下但只派3角色" failure mode.
+    # Gate reads config flag delegation.governance_gates.require_all_hands_count
+    # (default: enabled). Fail-open if user message unreadable.
+    # 2026-08-03: restored (deleted in c00b43039; user decided to re-enable the all-hands gate)
+    gates = cfg.get("governance_gates", {})
+    if gates.get("require_all_hands_count", True) and len(task_list) > 1:
+        # Note: single-task dispatch (len==1) is intentionally exempt — a one-off
+        # task with an all-hands trigger word in context is usually a follow-up
+        # action, not a standalone all-hands discussion. The gate only fires for
+        # multi-task batches (≥2) where partial role coverage is the risk.
+        _user_text = ""
+        _msgs = getattr(parent_agent, "_session_messages", None)
+        if _msgs:
+            for _m in reversed(_msgs):
+                if isinstance(_m, dict) and _m.get("role") == "user":
+                    _c = _m.get("content")
+                    _user_text = _c if isinstance(_c, str) else ""
+                    break
+        if _user_text and any(_trig in _user_text for _trig in _ALL_HANDS_TRIGGERS):
+            # All-hands = the four governance roles (烛龙/天元/白夜/百川),
+            # NOT every entry in agents_config (which may include non-role
+            # agents like tools runners). A fixed role count avoids false
+            # rejections when agents_config grows beyond the role set.
+            _expected = _ALL_HANDS_ROLE_COUNT
+            if len(task_list) < _expected:
+                return tool_error(
+                    f"[PROCESS-VIOLATION] All-hands discussion requires all "
+                    f"{_expected} roles to be dispatched (got {len(task_list)} tasks). "
+                    f"See HERMES §2.1 dispatch rules (all-hands triggers → all four roles)."
+                )
+
     children = []
     for i, t in enumerate(task_list):
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        # Per-task agent_name: override model/provider routing.
+        # When top-level agent_name is set, each task MUST specify its own.
+        task_agent_name = t.get("agent_name") or agent_name
+        # Fixed-agent mode: when top-level agent_name is set, every task
+        # must explicitly specify its own agent_name.
+        if agent_name and not t.get("agent_name"):
+            return tool_error(_missing_agent_name_error(i, "top-level"))
+        # Batch fallback: multi-task without agent_name
+        if not task_agent_name and len(task_list) > 1:
+            # When require_agent_name is enabled, batch delegation without
+            # explicit agent_name is an error — no silent round-robin.
+            if cfg.get("require_agent_name", True):
+                return tool_error(_missing_agent_name_error(i, "batch"))
+            # Legacy fallback: round-robin assign (only when require_agent_name=false)
+            if agents_config:
+                agent_names = list(agents_config.keys())
+                task_agent_name = agent_names[i % len(agent_names)]
+                logger.debug(
+                    "delegate_task: task[%d] agent_name auto-assigned → %s (round-robin, batch fallback)",
+                    i, task_agent_name,
+                )
+        # Default-agent fallback: single task still without agent_name → use config default
+        if not task_agent_name:
+            task_agent_name = cfg.get("default_agent")
+            if task_agent_name:
+                logger.warning(
+                    "delegate_task: task[%d] agent_name missing → defaulted to '%s' "
+                    "(delegation.default_agent). If a specific agent was intended, "
+                    "pass agent_name explicitly.",
+                    i, task_agent_name,
+                )
+        try:
+            task_creds = _resolve_agent_creds(
+                task_agent_name, role_bindings, creds,
+                task_index=i, agents_config=agents_config,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3842,22 +4048,26 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
+                # Patch 059: toolsets removed from model-facing schema.
+                # Operator config drives child toolsets via _get_default_toolsets().
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=t.get("acp_command")
+                or task_creds.get("command"),
+                override_acp_args=t.get("acp_args")
+                if t.get("acp_args") is not None
+                else task_creds.get("args"),
                 role=effective_role,
+                agent_name=task_agent_name,
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -3900,6 +4110,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
+            _single_kwargs = {}
+            if _t.get("timeout") is not None:
+                _single_kwargs["timeout_override"] = _safe_timeout_override(_t["timeout"])
             result = _run_single_child(
                 _i,
                 _t["goal"],
@@ -3908,6 +4121,7 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                **_single_kwargs,
             )
             results.append(result)
         else:
@@ -3923,9 +4137,7 @@ def delegate_task(
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
-                    future = executor.submit(
-                        child_context.run,
-                        _run_single_child,
+                    _submit_kwargs = dict(
                         task_index=i,
                         goal=t["goal"],
                         child=child,
@@ -3933,6 +4145,14 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                    )
+                    # Per-task timeout overrides global child_timeout_seconds
+                    if t.get("timeout") is not None:
+                        _submit_kwargs["timeout_override"] = _safe_timeout_override(t["timeout"])
+                    future = executor.submit(
+                        child_context.run,
+                        _run_single_child,
+                        **_submit_kwargs,
                     )
                     futures[future] = i
 
@@ -4414,6 +4634,165 @@ def _resolve_child_credential_pool(
     return None
 
 
+_BINDING_OVERRIDE_KEYS = ("model", "provider", "base_url", "api_key", "api_mode")
+
+# All-hands discussion trigger phrases (Patch 063).  Must stay in sync with
+# HERMES.md §1.1 协作表 (collaboration table; manual sync — changes require
+# updating both sides).
+_ALL_HANDS_TRIGGERS: frozenset = frozenset({
+    "讨论一下", "全员复审", "全员投票", "交叉一轮",
+})
+
+# Number of roles required for an all-hands discussion (Patch 063). Fixed at
+# 4 (烛龙/天元/白夜/百川) instead of len(agents_config) so growing the agent
+# config cannot silently reject valid all-hands dispatches.
+_ALL_HANDS_ROLE_COUNT = 4
+
+# Output-file whitelist (Patch 072, formerly P060): goal paths matching this
+# pattern grant the child the "file" toolset (HERMES §2.2 output-file
+# exception). Matches /tmp/batch_<name> with or without a trailing slash.
+_OUTPUT_FILE_WHITELIST_RE = re.compile(r"/tmp/batch_[^\s/]+")
+
+
+def _maybe_resolve_api_key_from_provider(merged, overridden_keys):
+    """Resolve api_key from provider when provider is overridden but key isn't.
+
+    Agent config entries typically specify provider/model/base_url but leave
+    api_key empty (the key lives in an env var or .env, resolved at runtime
+    via the provider registry).  Without this, the child inherits the
+    *parent's* api_key → 401 when the child targets a different provider.
+    """
+    if "provider" not in overridden_keys or "api_key" in overridden_keys:
+        return
+    _provider = merged.get("provider")
+    if not _provider:
+        return
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        _rt = resolve_runtime_provider(requested=_provider)
+        _key = _rt.get("api_key", "")
+        if _key:
+            merged["api_key"] = _key
+            overridden_keys.append("api_key")
+    except Exception as exc:
+        logger.warning(
+            "delegate_task: failed to resolve api_key for provider=%r (%s: %s). "
+            "Child will inherit parent api_key (cross-provider 401 risk).",
+            _provider, type(exc).__name__, exc,
+        )
+
+
+def _merge_binding_creds(
+    base_creds: dict,
+    entry: dict,
+    agent_name: str,
+    task_index: Optional[int] = None,
+    source_label: str = "",
+) -> dict:
+    """Merge a config entry (agents_config or role_bindings) into base_creds.
+
+    Shared by both resolution paths in _resolve_agent_creds.
+    *source_label* is appended to the debug log (e.g. " (agents_config)").
+    """
+    merged = dict(base_creds)
+    overridden = []
+    for key in _BINDING_OVERRIDE_KEYS:
+        val = entry.get(key)
+        if val:
+            merged[key] = val
+            overridden.append(key)
+    _maybe_resolve_api_key_from_provider(merged, overridden)
+    if overridden:
+        ctx = f"task {task_index} " if task_index is not None else ""
+        logger.debug(
+            "delegate_task: %sagent_name=%s%s → %s",
+            ctx, agent_name, source_label,
+            ", ".join(
+                f"{k}=***" if k == "api_key" else f"{k}={merged[k]!r}"
+                for k in overridden
+            ),
+        )
+    return merged
+
+
+def _resolve_agent_creds(
+    agent_name,
+    role_bindings,
+    base_creds,
+    *,
+    task_index=None,
+    agents_config=None,
+):
+    """Resolve per-agent credentials from agents_config or role_bindings.
+
+    Priority: agents_config > role_bindings > base_creds (passthrough).
+    """
+    if not agent_name:
+        return base_creds
+
+    # --- agents_config priority path ---
+    agent_entry = (agents_config or {}).get(agent_name)
+    if agent_entry is not None:
+        return _merge_binding_creds(
+            base_creds, agent_entry, agent_name, task_index,
+            source_label=" (agents_config)",
+        )
+
+    # --- role_bindings fallback path ---
+    if not role_bindings and not agents_config:
+        raise ValueError(
+            f"agent_name='{agent_name}' not found. "
+            f"No agents configured (delegation.agents and delegation.role_bindings are both empty)."
+        )
+
+    binding = role_bindings.get(agent_name)
+    if binding is None:
+        all_agents = set((agents_config or {}).keys()) | set((role_bindings or {}).keys())
+        available = ", ".join(sorted(all_agents)) or "(none)"
+        raise ValueError(
+            f"agent_name='{agent_name}' not found. "
+            f"Available: {available}"
+        )
+
+    return _merge_binding_creds(base_creds, binding, agent_name, task_index)
+
+
+def _get_available_agents_str() -> str:
+    """Return comma-joined agent names from delegation.agents + role_bindings.
+
+    Used in schema descriptions and error messages so the model sees the
+    user's actual configured agents without hardcoding names. Falls back
+    gracefully if config is unavailable (e.g. during import-time schema
+    construction in tests).
+    """
+    try:
+        cfg = _load_config()
+        names = set()
+        names.update((cfg.get("agents") or {}).keys())
+        names.update((cfg.get("role_bindings") or {}).keys())
+        if names:
+            return ", ".join(sorted(names))
+    except Exception:
+        pass
+    return "(see config.yaml delegation.agents or delegation.role_bindings)"
+
+
+_MISSING_AGENT_NAME_REASONS = {
+    "top-level": "When top-level agent_name is specified, each task must explicitly specify agent_name.",
+    "batch": "For batch delegation, each task must explicitly specify agent_name.",
+}
+
+
+def _missing_agent_name_error(task_index: int, mode: str) -> str:
+    """Build a standardized error for tasks missing agent_name."""
+    reason = _MISSING_AGENT_NAME_REASONS.get(mode, "agent_name is required.")
+    return (
+        f"Task {task_index} is missing 'agent_name'. "
+        f"{reason} "
+        f"Available: {_get_available_agents_str()}"
+    )
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -4720,6 +5099,10 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["agent_name"]["description"] = (
+        DELEGATE_TASK_SCHEMA["parameters"]["properties"]["agent_name"]["description"]
+        + " Available agents: " + _get_available_agents_str() + "."
+    )
 
     return {
         "description": _build_top_level_description(),
@@ -4761,6 +5144,24 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "agent_name": {
+                "type": "string",
+                "description": (
+                    "Top-level agent_name override for model/provider routing. "
+                    "When set, each task in a batch MUST explicitly specify its own "
+                    "per-task agent_name. When unset, single-task delegations fall "
+                    "back to delegation.default_agent from config.yaml."
+                ),
+            },
+            "timeout": {
+                "type": "number",
+                "description": (
+                    "Top-level timeout in seconds for single-task mode (goal=...). "
+                    "Overrides delegation.child_timeout_seconds. Per-task 'timeout' "
+                    "in batch mode takes precedence over this."
+                ),
+            },
+
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4788,6 +5189,14 @@ DELEGATE_TASK_SCHEMA = {
                                 "final failure). Keep schemas forgiving: "
                                 "require only fields you will actually read."
                             ),
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Per-task agent_name override for model/provider routing from role_bindings or agents_config.",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Per-task timeout in seconds. Overrides delegation.child_timeout_seconds for this task only.",
                         },
                     },
                     "required": ["goal"],
@@ -4881,7 +5290,7 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args", "toolsets"}
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
@@ -4912,7 +5321,11 @@ registry.register(
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
+        agent_name=args.get("agent_name"),
         role=args.get("role"),
+        timeout=args.get("timeout"),
+        # Patch 059: toolsets removed from model-facing schema.
+        toolsets=None,
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),
